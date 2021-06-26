@@ -1,10 +1,17 @@
 ﻿using System;
+using System.Buffers.Text;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Mail;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -839,6 +846,798 @@ namespace Pchp.Library
     //[PhpExtension("IMAP")] // uncomment when the extension is ready
     public static class Imap
     {
+        #region Constants
+        readonly static Encoding ISO_8859_1 = Encoding.GetEncoding("ISO-8859-1");
+
+        public const int CL_EXPUNGE = 32768;
+        #endregion
+
+        #region ImapResource
+        /// <summary>
+        /// Base of protocols POP3, IMAP and NNTP.
+        /// </summary>
+        internal abstract class MailResource : PhpResource
+        {
+            private enum Service { IMAP, NNTP, POP3};
+
+            /// <summary>
+            /// Represents a connection between a client and server.
+            /// </summary>
+            protected Stream _stream;
+            /// <summary>
+            /// Represents an initial connection string.
+            /// </summary>
+            protected MailBoxInfo _info;
+
+            #region Contructors
+            protected MailResource() : base("imap") { }
+
+            /// <summary>
+            /// Creates a client for one of three supported protocols. 
+            /// </summary>
+            /// <param name="info">A connection string, which contains info about desired protocol. Default is IMAP.</param>
+            /// <returns>The client of desired protocol or NULL if there is a problem with the connection.</returns>
+            public static MailResource Create(MailBoxInfo info)
+            {
+                if (info == null)
+                    return null;
+
+                MailResource result = null;
+                Stream stream = GetStream(info);
+                if (stream == null)
+                    return null;
+
+                if (String.IsNullOrEmpty(info.Service))
+                {
+                    if (info.NameFlags.Contains("imap") || info.NameFlags.Contains("imap2") || info.NameFlags.Contains("imap2bis")
+                        || info.NameFlags.Contains("imap4") || info.NameFlags.Contains("imap4rev1"))
+                        result = CreateImap(info, stream);
+                    else if (info.NameFlags.Contains("pop3"))
+                        result = CreatePop3(info, stream);
+                    else if (info.NameFlags.Contains("nntp"))
+                        result = CreateNntp(info, stream);
+                    else // Default is imap                   
+                        result = CreateImap(info, stream);
+                }
+                else
+                {
+
+                    switch (info.Service)
+                    {
+                        case "pop3":
+                            result = CreatePop3(info, stream);
+                            break;
+                        case "nntp":
+                            result = CreateNntp(info, stream);
+                            break;
+                        default: // Default is imap
+                            result = CreateImap(info, stream);
+                            break;
+                    }
+                }
+
+                return result;
+            }
+
+            /// <summary>
+            /// Creates IMAP client with a specific type of connection(TLS, SSL, ...).
+            /// </summary>
+            /// <param name="info">Info can contain information about a type of connection(security, tls, ...)</param>
+            /// <param name="stream">A stream which is connected to a server.</param>
+            /// <returns>Returns the client or null, if there is problem with the connection.</returns>
+            private static ImapResource CreateImap(MailBoxInfo info, Stream stream)
+            {
+                if (info == null || stream == null)
+                    return null;
+
+                ImapResource resource = ImapResource.Create(GetStream(info));
+                if (resource == null)
+                    return null;
+
+                resource._info = info; // Save info about connection
+
+                if (info.NameFlags.Contains("secure")) // StartTLS with validation
+                    resource.StartTLS(true);
+                else if (info.NameFlags.Contains("tls"))// StartTLS
+                    resource.StartTLS(!info.NameFlags.Contains("novalidate-cert"));
+
+                return resource;
+            }
+
+            /// <summary>
+            /// Creates POP3 client with a specific type of connection(TLS, SSL, ...)
+            /// </summary>
+            /// <param name="info">Info can contain information about a type of connection(security, tls, ...)</param>
+            /// <param name="stream">A stream which is connected to a server.</param>
+            /// <returns>Returns the client or null, if there is problem with the connection.</returns>
+            private static POP3Resource CreatePop3(MailBoxInfo info, Stream stream)
+            {
+                if (info == null || stream == null)
+                    return null;
+
+                POP3Resource resource = POP3Resource.Create(GetStream(info));
+                if (resource == null)
+                    return null;
+
+                resource._info = info; // Save info about connection
+
+                if (info.NameFlags.Contains("secure")) // StartTLS with validation
+                    resource.StartTLS(true);
+                else if (info.NameFlags.Contains("tls"))// StartTLS
+                    resource.StartTLS(!info.NameFlags.Contains("novalidate-cert"));
+
+                return resource;
+            }
+
+            /// <summary>
+            /// Creates NNTP client with a specific type of connection(TLS, SSL, ...)
+            /// </summary>
+            /// <param name="info">Info can contain information about a type of connection(security, tls, ...)</param>
+            /// <param name="stream">A stream which is connected to a server.</param>
+            /// <returns>Returns the client or null, if there is problem with the connection.</returns>
+            private static ImapResource CreateNntp(MailBoxInfo info, Stream stream)
+            {
+                if (info == null || stream == null)
+                    return null;
+
+                //TODO: Support for NNTP protocol
+                throw new NotImplementedException();
+            }
+
+            /// <summary>
+            /// Creates a stream which is connected to a server. Makes no-secure conection by default.
+            /// </summary>
+            /// <param name="info">Info which contains info about server address</param>
+            /// <returns>Stream or null, if there is a problem with a connetion.</returns>
+            private static Stream GetStream(MailBoxInfo info)
+            {
+                if (info == null)
+                    return null;
+
+                TcpClient client;
+                try
+                {
+                    client = new TcpClient(info.Hostname, info.Port);
+                }
+                catch (Exception ex)
+                {
+                    if (ex is ArgumentNullException || ex is SocketException)
+                        return null;
+
+                    throw;
+                }
+
+
+                if (info.NameFlags.Contains("notls")) // There is nothing to do yet and return non-secure connection (can be later change by starttls command)
+                    return client.GetStream();
+
+                if (info.NameFlags.Contains("ssl"))
+                    return MakeSslConection(client.GetStream(), info);
+
+                return client.GetStream(); // Makes no-secure conection by default.
+            }
+
+            /// <summary>
+            /// Makes authentication and ssl conection according to settings in info.
+            /// </summary>
+            /// <param name="stream">A stream which is connected to server.</param>
+            /// <param name="info">The information about connection string.</param>
+            /// <returns>Sslstream or null, if there is a problem with authentication.</returns>
+            protected static SslStream MakeSslConection(Stream stream, MailBoxInfo info)
+            {
+                SslStream result;
+                try
+                {
+                    if (info.NameFlags.Contains("novalidate-cert"))
+                        result = new SslStream(stream, false, (sender, certificate, chain, sslPolicyErrors) => true);
+                    else // Validate Certificate
+                        result = new SslStream(stream, false, ValidateServerCertificate);
+
+                    result.AuthenticateAsClient(info.Hostname);
+                }
+                catch (AuthenticationException)
+                {
+                    return null;
+                }
+
+                return result;
+            }
+
+            /// <summary>
+            /// Validates a certificate. Copied from https://docs.microsoft.com/en-us/dotnet/api/system.net.security.sslstream?view=netcore-3.1. 
+            /// </summary>
+            /// <returns>Returns true if <see cref="SslPolicyErrors"/> is equal to None, false otherwise.</returns>
+            protected static bool ValidateServerCertificate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors)
+            {
+                if (sslPolicyErrors == SslPolicyErrors.None)
+                    return true;
+
+                // Refuse connection
+                return false;
+            }
+            #endregion
+
+            #region Methods
+            /// <summary>
+            /// Receive bytes. The bytes represents responses from server and has to be ended \r\n.
+            /// </summary>
+            /// <param name="wait">Set false, if you don't want to wait until response arrived.</param>
+            /// <returns>Returns bytes ended by \r\n, or null if there is no response and you don't want to wait for response.</returns>
+            protected byte[] ReceiveBytes(bool wait = true)
+            {
+                byte[] buffer = new byte[2];
+                int length = 0;
+
+                if (!wait)
+                {
+                    _stream.ReadTimeout = 2;
+                    try
+                    {
+                        length = _stream.Read(buffer, 0, buffer.Length);
+                    }
+                    catch (TimeoutException)
+                    {
+                        return null;
+                    }
+                    finally
+                    {
+                        _stream.ReadTimeout = -1;
+                    }
+                }
+                else
+                {
+                    length = _stream.Read(buffer, 0, buffer.Length);
+                }
+
+                //Wait for complete message.
+                while (buffer[length - 2] != '\r' || buffer[length - 1] != '\n')
+                {
+                    Task.Delay(1);
+                    int bufferSize = 1024;
+
+                    byte[] newBuffer = new byte[buffer.Length + bufferSize];
+                    length = _stream.Read(newBuffer, buffer.Length, bufferSize);
+                    Buffer.BlockCopy(buffer, 0, newBuffer, 0, buffer.Length);
+                    length = length + buffer.Length;
+                    buffer = newBuffer;
+                }
+
+                return buffer;
+            }
+            protected abstract bool StartTLS(bool sslValidation);
+            public abstract bool Login(string username, string password);
+            public abstract bool Close();
+            #endregion
+        }
+
+        /// <summary>
+        /// Context of POP3 session.
+        /// </summary>
+        internal class POP3Resource : MailResource
+        {
+            /// <summary>
+            /// Represents a status of received message. There are two types in POP3.
+            /// </summary>
+            private enum Status { OK, ERR, None};
+
+            /// <summary>
+            /// Represents a response from a server. 
+            /// </summary>
+            class POP3Response
+            {
+                /// <summary>
+                /// Status of sent command.
+                /// </summary>
+                public Status Status { get; set; } = Status.None;
+                /// <summary>
+                /// The rest of message.
+                /// </summary>
+                public string Body { get; set; } = null;
+                /// <summary>
+                /// Complete message delimeted by \r\n sequence(Common ending sequence in POP3).
+                /// </summary>
+                public byte[] Raw { get; set; } = null;
+                /// <summary>
+                /// Tries to parse a server response.
+                /// </summary>
+                /// <param name="buffer">Buffer, which contains one message ended by \r\n.</param>
+                /// <param name="response">The result.</param>
+                /// <returns> If the header hasn't the standard form, Only Raw property is filled.</returns>
+                public static bool TryParse(byte[] buffer, out POP3Response response)
+                {
+                    response = new POP3Response();
+                    if (buffer == null)
+                        return false;
+
+                    int index = 0;
+
+                    // Status
+                    if (buffer.Length >= 3 && buffer[index] == OkTag[0] && buffer[index + 1] == OkTag[1] && buffer[index + 2] == OkTag[2])
+                    {
+                        response.Status = Status.OK;
+                        index = index + 3;
+                    }
+                    else if (buffer.Length >= 4 && buffer[index] == ErrTag[0] && buffer[index + 1] == ErrTag[1] && buffer[index + 2] == ErrTag[2] && buffer[index + 3] == ErrTag[3])
+                    {
+                        response.Status = Status.ERR;
+                        index = index + 4;
+                    }
+                    else
+                    {
+                        response.Status = Status.None;
+                    }
+
+                    if (index < buffer.Length && buffer[index] == ' ')
+                        index++;
+
+                    // Body
+                    response.Body = Encoding.ASCII.GetString(buffer, index, buffer.Length - index);
+                    response.Raw = buffer;
+
+                    return true;
+                }
+            }
+
+            #region Constants
+            const string OkTag = "+OK";
+            const string ErrTag = "-ERR";
+            #endregion
+
+            #region Constructors
+
+            /// <summary>
+            /// Creates IMAP client.
+            /// </summary>
+            /// <param name="stream">A stream which is connected to server.</param>
+            /// <returns>Returns the client or null if there is problem with receiving an initial message.</returns>
+            public static POP3Resource Create(Stream stream)
+            {
+                POP3Resource resource = new POP3Resource();
+                resource._stream = stream;
+
+                List<POP3Response> responses = resource.Receive();
+
+                return (responses != null && responses.Count != 0 && responses[0].Status == Status.OK) ? resource : null;
+            }
+            #endregion
+
+            #region Methods
+            /// <summary>
+            /// Executes the command STLS.
+            /// </summary>
+            /// <param name="sslValidation">Set false if you don't want certificate validation.</param>
+            /// <returns>Returns true on success, false otherwise.</returns>
+            protected override bool StartTLS(bool sslValidation)
+            {
+                string command = $"STLS\r\n";
+                Write(command);
+
+                List<POP3Response> responses = Receive();
+                    if (responses[0].Status != Status.OK) //It should be the first message.
+                        return false;
+
+                var stream = MakeSslConection(_stream, _info);
+                if (stream == null)
+                {
+                    return false;
+                }
+                else
+                {
+                    _stream = stream;
+                    return true;
+                }
+            }
+
+            /// <summary>
+            /// Writes command into stream.
+            /// </summary>
+            /// <param name="command">An POP3 command.</param>
+            private void Write(string command)
+            {
+                _stream.Write(Encoding.ASCII.GetBytes(command));
+            }
+
+            /// <summary>
+            /// Receives a response from server. Server can send more than one response.
+            /// </summary>
+            /// <param name="wait">Set false, if you don't want to wait until response arrived.</param>
+            /// <returns>Returns response(s), or null if there is no response and you don't want to wait for response.</returns>
+            private List<POP3Response> Receive(bool wait = true)
+            {
+                byte[] buffer = ReceiveBytes(wait);
+                if (buffer == null)
+                    return null;
+
+                List<POP3Response> responses = new List<POP3Response>();
+                int startIndex = 0;
+                for (int i = 1; i < buffer.Length; i++)
+                {
+                    if (buffer[i] == '\n' && buffer[i - 1] == '\r') // Split the message (Server's responses are ended by \r\n sequence) 
+                    {
+                        if (POP3Response.TryParse(buffer.Slice(startIndex, i - startIndex + 1), out POP3Response pop3))
+                            responses.Add(pop3);
+
+                        startIndex = i + 1;
+                    }
+                }
+
+                return responses;
+            }
+
+            /// <summary>
+            /// Executes commands USER {username} and PASS {password.}
+            /// </summary>
+            /// <returns>Returns true on success or false on failure.</returns>
+            public override bool Login(string username, string password)
+            {
+                Write($"USER {username}\r\n");
+
+                List<POP3Response> responses = Receive();
+                if (responses == null || responses.Count == 0 || responses[0].Status != Status.OK)
+                    return false;
+
+                Write($"PASS {password}\r\n");
+                
+                responses = Receive();
+                return ((responses != null || responses.Count != 0) && responses[0].Status == Status.OK);
+            }
+
+            /// <summary>
+            /// Executes QUIT and calls FreeManaged.
+            /// </summary>
+            public override bool Close()
+            {
+                Write($"QUIT\r\n");
+
+                List<POP3Response> responses = Receive();
+                bool result = ((responses != null || responses.Count != 0) && responses[0].Status == Status.OK);
+
+                if (result)
+                    FreeManaged();
+
+                return result;
+            }
+
+            protected override void FreeManaged()
+            {
+                _stream.Close();
+                _stream.Dispose();
+                base.FreeManaged();
+            }
+            #endregion
+        }
+
+        /// <summary>
+        /// Context of NNTP session.
+        /// </summary>
+        internal class NNTPResource : MailResource
+        {
+            public override bool Close()
+            {
+                throw new NotImplementedException();
+            }
+
+            public override bool Login(string username, string password)
+            {
+                throw new NotImplementedException();
+            }
+
+            protected override bool StartTLS(bool sslValidation)
+            {
+                throw new NotImplementedException();
+            }
+        }
+
+        /// <summary>
+        /// Context of IMAP session.
+        /// </summary>
+        internal class ImapResource : MailResource
+        {
+            /// <summary>
+            /// Represents a status of received message. There are three types in IMAP.
+            /// </summary>
+            private enum Status { OK, NO, BAD, None };
+
+            /// <summary>
+            /// Represents a response from a server. 
+            /// </summary>
+            class ImapResponse
+            {
+                /// <summary>
+                /// Tag used by IMAP for monitoring status of a command.
+                /// </summary>
+                public string Tag { get; set; } = null;
+                /// <summary>
+                /// Status of sent command.
+                /// </summary>
+                public Status Status { get; set; } = Status.None;
+                /// <summary>
+                /// The rest of message.
+                /// </summary>
+                public string Body { get; set; } = null;
+                /// <summary>
+                /// Complete message delimeted by \r\n sequence(Common ending sequence in IMAP).
+                /// </summary>
+                public byte[] Raw { get; set; } = null;
+
+                /// <summary>
+                /// Tries to parse a server response.
+                /// </summary>
+                /// <param name="buffer">Buffer, which contains one message ended by \r\n.</param>
+                /// <param name="response">The result.</param>
+                /// <returns> If the header hasn't the standard form, Only Raw property is filled.</returns>
+                public static bool TryParse(byte[] buffer, out ImapResponse response)
+                {
+                    response = new ImapResponse();
+                    if (buffer == null)
+                        return false;
+
+                    int index = 0;
+
+                    // Tag property
+                    if (buffer[index] == UnTaggedTag)
+                    {
+                        response.Tag = UnTaggedTag.ToString();
+                        index++;
+                    }
+                    else if (buffer[index] == ContinousTag)
+                    {
+                        response.Tag = ContinousTag.ToString();
+                        index++;
+                    }
+                    else if (buffer[index] == TagPrefix)
+                    {
+                        index++;
+                        while (index < buffer.Length && buffer[index] >= '0' && buffer[index] <= '9')
+                            index++;
+
+                        response.Tag = Encoding.ASCII.GetString(buffer, 0, index);
+                    }
+
+                    if (index < buffer.Length && buffer[index] == ' ')
+                        index++;
+
+                    // Status property
+                    if (index + 1 < buffer.Length)
+                    {
+                        if (buffer[index] == 'N' && buffer[index + 1] == 'O')
+                        {
+                            response.Status = Status.NO;
+                            index += 2;
+                        }
+                        else if (buffer[index] == 'O' && buffer[index + 1] == 'K')
+                        {
+                            response.Status = Status.OK;
+                            index += 2;
+                        }
+                        else if (index + 2 < buffer.Length && buffer[index] == 'D' && buffer[index + 1] == 'A' && buffer[index + 2] == 'D')
+                        {
+                            response.Status = Status.BAD;
+                            index += 3;
+                        }
+                        else
+                            response.Status = Status.None;
+                    }
+
+                    // Body property
+                    response.Body = Encoding.ASCII.GetString(buffer, index, buffer.Length - index);
+
+                    // Raw property
+                    response.Raw = buffer;
+
+                    return true;
+                }
+            }
+
+            #region Constants
+            // Tags belong to responses from a server.
+            const char UnTaggedTag = '*';
+            const char ContinousTag = '+';
+            const char TagPrefix = 'A';
+            #endregion
+
+            #region Properties
+            /// <summary>
+            /// Represents next number of tag, which will be used to send new message to server in format {TagPrefix}{_tag}.
+            /// </summary>
+            private int _tag = 0;
+            #endregion
+
+            #region Constructors
+            private ImapResource() {}
+
+            /// <summary>
+            /// Creates IMAP client.
+            /// </summary>
+            /// <param name="stream">A stream which is connected to server.</param>
+            /// <returns>Returns the client or null if there is problem with receiving an initial message.</returns>
+            public static ImapResource Create(Stream stream)
+            {
+                ImapResource resource = new ImapResource();
+                resource._stream = stream;
+
+                // The server should send an initial message.
+                List<ImapResponse> responses = resource.Receive();
+                if (responses == null || responses.Count == 0)
+                    return null;
+
+                // First message should contain information about connection status.
+                return (responses[0].Status == Status.OK) ? resource : null;
+            }
+            #endregion
+
+            #region Methods
+
+            /// <summary>
+            /// Executes the command STARTTLS.
+            /// </summary>
+            /// <param name="sslValidation">Set false if you don't want certificate validation.</param>
+            /// <returns>Returns true on success, false otherwise.</returns>
+            protected override bool StartTLS(bool sslValidation = true)
+            {
+                string messageTag = $"{TagPrefix}{_tag.ToString()}";
+                string command = $"{messageTag} STARTTLS\r\n";
+                Write(command);
+
+                bool completed = false;
+                while (!completed) // Waits until command is completed(Server sends OK message with right messageTag)
+                {
+                    List<ImapResponse> responses = Receive();
+                    if (responses == null || responses.Count == 0)
+                        continue;
+
+                    /* Server can send more then one messages. 
+                     * We have to find the one, which contains information about command status.
+                     * */
+                    foreach (var response in responses)
+                        if (response.Tag == messageTag) // There has to be message with right tag.
+                            if (response.Status != Status.OK) // Returns, if command failed.
+                                return false;
+                            else
+                                completed = true;
+                }
+
+                var stream = MakeSslConection(_stream, _info);
+                if (stream == null)
+                {
+                    return false;
+                }
+                else
+                {
+                    _stream = stream;
+                    return true;
+                }
+            }
+
+            /// <summary>
+            /// Writes command into stream and increment the tag.
+            /// </summary>
+            /// <param name="command">An IMAP command.</param>
+            private void Write(string command)
+            {
+                _stream.Write(Encoding.ASCII.GetBytes(command));
+                _tag++;
+            }
+
+            /// <summary>
+            /// Receives a response from server. Server can send more than one response.
+            /// </summary>
+            /// <param name="wait">Set false, if you don't want to wait until response arrived.</param>
+            /// <returns>Returns response(s), or null if there is no response and you don't want to wait for response.</returns>
+            private List<ImapResponse> Receive(bool wait = true)
+            {
+                byte[] buffer = ReceiveBytes(wait);
+                if (buffer == null)
+                    return null;
+
+                List<ImapResponse> responses = new List<ImapResponse>();
+                int startIndex = 0;
+                for (int i = 1; i < buffer.Length; i++)
+                {
+                    if (buffer[i] == '\n' && buffer[i - 1] == '\r') // Split the message (Server's responses are ended by \r\n sequence)  
+                    {
+                        if (ImapResponse.TryParse(buffer.Slice(startIndex, i - startIndex + 1), out ImapResponse imap))
+                            responses.Add(imap);
+
+                        startIndex = i + 1;
+                    }
+                }
+
+                return responses;
+            }
+
+            /// <summary>
+            /// Executes command LOGIN {username} {password}.
+            /// </summary>
+            /// <returns>Returns true on success or false on failure.</returns>
+            public override bool Login(string username, string password)
+            {
+                string messageTag = $"{TagPrefix}{_tag.ToString()}";
+                Write($"{messageTag} LOGIN {username} {password}\r\n");
+
+                while (true) // Waits for the response.
+                {
+                    List<ImapResponse> responses = Receive();
+                    foreach (var response in responses)
+                        if (response.Tag == messageTag)
+                            return response.Status == Status.OK;
+                }
+            }
+
+            /// <summary>
+            /// Excutes command SELECT {path}.
+            /// </summary>
+            /// <param name="path">The path in mailbox.</param>
+            /// <returns>Returns true on success or false on failure.</returns>
+            public bool Select(string path)
+            {
+                string messageTag = $"{TagPrefix}{_tag.ToString()}";
+                Write($"{messageTag} SELECT {path}\r\n");
+
+                while (true) // Waits for the response.
+                {
+                    List<ImapResponse> responses = Receive();
+                    foreach (var response in responses)
+                        if (response.Tag == messageTag)
+                            return response.Status == Status.OK;
+                }
+            }
+
+            /// <summary>
+            /// Executes LOGOUT and calls FreeManaged.
+            /// </summary>
+            public override bool Close()
+            {
+                string messageTag = $"{TagPrefix}{_tag.ToString()}";
+                Write($"{messageTag} LOGOUT\r\n");
+
+                bool result = false;
+                bool completed = false;
+                while (!completed) // Waits for the response.
+                {
+                    List<ImapResponse> responses = Receive();
+                    foreach (var response in responses)
+                        if (response.Tag == messageTag)
+                        {
+                            result = response.Status == Status.OK;
+                            completed = true;
+                            break;
+                        }
+                }
+
+                if (result)
+                    FreeManaged();
+
+                return result;
+            }
+
+            protected override void FreeManaged()
+            {
+                _stream.Close();
+                _stream.Dispose();
+                base.FreeManaged();
+            }
+            #endregion
+        }
+        #endregion
+
+        #region Unsorted
+        /// <summary>
+        /// Gets instance of <see cref="MailResource"/> or <c>null</c>.
+        /// If given argument is not an instance of <see cref="MailResource"/>, PHP warning is reported.
+        /// </summary>
+        static MailResource ValidateMailResource(PhpResource context)
+        {
+            if (context is MailResource h && h.IsValid)
+            {
+                return h;
+            }
+
+            //
+            PhpException.Throw(PhpError.Warning, Resources.Resources.invalid_context_resource);
+            return null;
+        }
+
         /// <summary>
         /// Parses an address string.
         /// </summary>
@@ -869,5 +1668,453 @@ namespace Pchp.Library
             //
             return arr;
         }
+        #endregion
+
+        #region encode,decode
+
+        #region utf7
+        /// <summary>
+        /// Transforms bytes to modified UTF-7 text as defined in RFC 2060
+        /// </summary>
+        private static string TransformUTF8ToUTF7Modified(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0)
+                return string.Empty;
+
+            var builder = StringBuilderUtilities.Pool.Get();
+
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                // Chars from 0x20 to 0x7e are unchanged excepts "&" which is replaced by "&-".
+                if (bytes[i] >= 0x20 && bytes[i] <= 0x7e)
+                {
+                    if (bytes[i] == 0x26)
+                        builder.Append("&-");
+                    else
+                        builder.Append((char)bytes[i]);
+                }
+                else // Collects all bytes until Char from 0x20 to 0x7eis reached.
+                {
+                    int index = i;
+                    while ( i < bytes.Length && (bytes[i] < 0x20 || bytes[i] > 0x7e))
+                        i++;
+
+                    //Add bytes to stringbuilder
+                    //builder.Append("&" + Encoding.UTF8.GetString(bytes, index, i - index).Replace("/", ",") + "-");
+                    builder.Append("&" + System.Convert.ToBase64String(bytes, index, i - index).Replace("/", ",") + "-");
+
+                    if (i < bytes.Length)
+                        i--;
+                }
+            }
+
+            return StringBuilderUtilities.GetStringAndReturn(builder);
+        }
+
+        private static string TransformUTF7ModifiedToUTF8(Context ctx, string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return null;
+
+            var builder = StringBuilderUtilities.Pool.Get();
+
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (text[i] == '&')
+                {
+                    //if (i == text.Length - 1)
+                    //    ; // Error
+
+                    if (text[++i] == '-') // Means "&" char.
+                        builder.Append("&");
+                    else // Shift
+                    {
+                        int index = i;
+                        while (i < text.Length && text[i] != '-')
+                            i++;
+
+                        string encode = text.Substring(index, i - index);
+                        if (encode.Length % 4 != 0)
+                            encode = encode.PadRight(encode.Length + (4 - encode.Length % 4), '=');
+       
+                        builder.Append(Encoding.UTF7.GetString(System.Convert.FromBase64String(encode.Replace(",","/"))));
+                    }
+                }
+                else if (text[i] >= 0x20 && text[i] <= 0x7e)
+                {
+                    builder.Append(text[i]);
+                }
+                else
+                { 
+                //Error
+                }
+            }
+
+            return StringBuilderUtilities.GetStringAndReturn(builder);
+        }
+
+        /// <summary>
+        /// Converts ctx.StringEncoding encoding to UTF-7 modified(used in IMAP) see RFC 2060.
+        /// </summary>
+        private static PhpString ToUTF7Modified(Context ctx, string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return PhpString.Empty;
+
+            using MemoryStream stream = new MemoryStream();
+            using BinaryWriter writer = new BinaryWriter(stream);
+
+            byte[] ampSequence = new byte[] { 0x26, 0x2D }; // Means characters '&' and '-'.
+
+            for (int i = 0; i < text.Length; i++)
+            {
+                // Chars from 0x20 to 0x7e are unchanged excepts "&" which is replaced by "&-".
+                if (text[i] >= 0x20 && text[i] <= 0x7e)
+                {
+                    if (text[i] == 0x26)
+                        writer.Write(ampSequence);
+                    else
+                        writer.Write(text[i]);
+                }
+                else // Collects all bytes until Char from 0x20 to 0x7e is reached.
+                {
+                    int start = i;
+                    while (i < text.Length && (text[i] < 0x20 || text[i] > 0x7e))
+                        i++;
+
+                    string sequence = text.Substring(start, i - start);
+                    // By RFC it shloud be encoded by UTF16BE, but PHP behaves in a different way.
+                    byte[] sequenceEncoded = ctx.StringEncoding.GetBytes(sequence);
+
+                    string base64Modified = System.Convert.ToBase64String(sequenceEncoded).Replace('/', ',').Trim('=');
+
+                    writer.Write('&');
+                    writer.Write(Encoding.ASCII.GetBytes(base64Modified));
+                    writer.Write('-');
+
+                    if (i < text.Length)
+                        i--;
+                }
+            }
+
+            writer.Flush();
+            return new PhpString(stream.ToArray());
+        }
+
+        /// <summary>
+        /// Converts UTF-7 modified(used in IMAP) see RFC 2060 encoding to .
+        /// </summary>
+        private static PhpString FromUTF7Modified(Context ctx, PhpString text)
+        {
+            if (text.IsEmpty)
+                return string.Empty;
+
+            byte[] utf7Modified = text.ToBytes(ctx.StringEncoding);
+
+            using MemoryStream stream = new MemoryStream();
+            using BinaryWriter writer = new BinaryWriter(stream);
+
+            for (int i = 0; i < utf7Modified.Length; i++)
+            {
+                if (utf7Modified[i] == '&')
+                {
+                    if (i == utf7Modified.Length - 1)
+                        throw new FormatException(); // Error
+
+                    if (utf7Modified[++i] == '-') // Means "&" char.
+                    {
+                        writer.Write((byte)'&');
+                    }
+                    else // Shifting
+                    {       
+                        int start = i;
+                        while (i < utf7Modified.Length && utf7Modified[i] != '-')
+                            i++;
+
+                        string sequence = Encoding.ASCII.GetString(utf7Modified, start, i - start).Replace(',','/');
+
+                        if ((sequence.Length % 4) != 0) // Adds padding
+                            sequence = sequence.PadRight(sequence.Length + 4 - (sequence.Length % 4),'=');
+
+                        byte[] base64Decoded = System.Convert.FromBase64String(sequence);
+
+                        writer.Write(base64Decoded);
+                    }
+                }
+                else if (text[i] >= 0x20 && text[i] <= 0x7e)
+                {
+                    writer.Write((byte)text[i]);
+                }
+                else
+                {
+                    throw new FormatException(); // Error
+                }
+            }
+
+            writer.Flush();
+            return new PhpString(stream.ToArray());
+        }
+
+        /// <summary>
+        /// Converts ISO-8859-1 string to modified UTF-7 text.
+        /// </summary>
+        /// <param name="ctx">The context of script.</param>
+        /// <param name="data">An ISO-8859-1 string.</param>
+        /// <returns>Returns data encoded with the modified UTF-7 encoding as defined in RFC 2060</returns>
+        public static PhpString imap_utf7_encode(Context ctx, PhpString data)
+        {
+
+
+
+
+
+
+
+
+
+
+
+
+
+            return ToUTF7Modified(ctx, data.ToString(ctx));
+        }
+
+        /// <summary>
+        /// Decodes modified UTF-7 text into ISO-8859-1 string.
+        /// </summary>
+        /// <param name="ctx"></param>
+        /// <param name="text">A modified UTF-7 encoding string, as defined in RFC 2060</param>
+        /// <returns>Returns a string that is encoded in ISO-8859-1 and consists of the same sequence of characters in text,
+        /// or FALSE if text contains invalid modified UTF-7 sequence or
+        /// text contains a character that is not part of ISO-8859-1 character set.</returns>
+        public static PhpString imap_utf7_decode(Context ctx, PhpString text)
+        {
+            return FromUTF7Modified(ctx, text);
+        }
+        #endregion
+
+        #region base64
+
+        /// <summary>
+        /// Decodes the given BASE-64 encoded text.
+        /// </summary>
+        /// <param name="ctx">The context of script.</param>
+        /// <param name="text">The encoded text.</param>
+        /// <returns>Returns the decoded message as a string.</returns>
+        public static string imap_base64(Context ctx, string text)
+        {
+            try
+            {
+                return ctx.StringEncoding.GetString(Base64Utils.FromBase64(text.AsSpan(), true));
+            }
+            catch (FormatException)
+            {
+
+                return string.Empty;
+            }    
+        }
+
+        #endregion
+
+        #endregion
+
+        #region connection, errors, quotas
+
+        /// <summary>
+        /// Represents parsed "conection string" from image_open.
+        /// </summary>
+        internal class MailBoxInfo
+        {
+            public string Hostname { get; set; }
+            public int Port { get; set; }
+            public string MailBoxName { get; set; }
+            public HashSet<string> NameFlags { get; set; } = new HashSet<string>();
+            public string Service { get; set; }
+            public string User { get; set; }
+            public string Authuser { get; set; }
+        }
+
+        /// <summary>
+        /// Parses mailbox.
+        /// </summary>
+        /// <param name="mailbox">The mailbox has the format: "{" remote_system_name [":" port] [flags] "}" [mailbox_name]</param>
+        /// <param name="info">Parsed information about mailbox.</param>
+        /// <returns>True on Success, False on failure.</returns>
+        static bool TryParseHostName(string mailbox, out MailBoxInfo info)
+        {
+            info = new MailBoxInfo();
+            if (String.IsNullOrEmpty(mailbox))
+                return false;
+
+            int index = 0;
+            int startSection = index;
+
+            string GetName(string mailbox)
+            {
+                int startIndex = index;
+                while (mailbox.Length > index && ((mailbox[index] >= 'a' && mailbox[index] <= 'z')
+                  || (mailbox[index] >= 'A' && mailbox[index] <= 'Z') || (mailbox[index] >= '0' && mailbox[index] <= '9')) || mailbox[index] == '-')
+                    index++;
+
+                return (index == startIndex) ? null : mailbox.Substring(startIndex, index - startIndex);
+            }
+
+            // Mandatory char '{' 
+            if (mailbox[index++] != '{') 
+                return false;
+
+            // Finds remote_system_name
+            startSection = index;
+            while (mailbox.Length > index && mailbox[index] != '/' && mailbox[index] != ':' && mailbox[index] != '}')
+                index++;
+
+            if (startSection == index)
+                return false;
+            else
+                info.Hostname = mailbox.Substring(1, index - 1);
+
+            // Finds port number
+            startSection = index + 1;
+            if (mailbox[index++] == ':')
+            {
+                while (mailbox.Length > index && mailbox[index] >= '0' && mailbox[index] <= '9')
+                    index++;
+
+                if (mailbox[index] != '/' && mailbox[index] != '}' && index == startSection)
+                    return false;
+                else
+                    info.Port = int.Parse(mailbox.Substring(startSection, index - startSection));
+            }
+
+            // Finds flags
+            startSection = index + 1;
+            if (mailbox[index] == '/')
+            {
+                index++;
+                while (true)
+                {
+                    string flag = GetName(mailbox);
+
+                    if (String.IsNullOrEmpty(flag))
+                        return false;
+
+                    if (flag == "service" || flag == "user" || flag == "authuser")
+                    {
+                        if (mailbox[index++] != '=')
+                            return false;
+
+                        string name = GetName(mailbox);
+                        if (String.IsNullOrEmpty(name))
+                            return false;
+
+                        switch (flag)
+                        {
+                            case "service":
+                                info.Authuser = name;
+                                break;
+                            case "user":
+                                info.User = name;
+                                break;
+                            case "authuser":
+                                info.Authuser = name;
+                                break;
+                        }
+                    }
+                    else
+                    {
+                        info.NameFlags.Add(flag);
+                    }
+
+                    if (mailbox.Length <= index || mailbox[index] == '}')
+                        break;
+                    else
+                        startSection = ++index;
+                }
+            }
+
+            // Mandatory char '{' 
+            if (mailbox.Length <= index || mailbox[index] != '}')
+                return false;
+
+            // Finds mailbox box directory.
+            if (mailbox.Length > ++index)
+                info.MailBoxName = mailbox.Substring(index, mailbox.Length - index);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Open an IMAP stream to a mailbox. This function can also be used to open streams to POP3 and NNTP servers, but some functions and features are only available on IMAP servers.
+        /// </summary>
+        /// <param name="mailbox">A mailbox name consists of a server and a mailbox path on this server.</param>
+        /// <param name="username">The user name.</param>
+        /// <param name="password">The password associated with the username.</param>
+        /// <param name="options">The options are a bit mask of connection options.</param>
+        /// <param name="n_retries">Number of maximum connect attempts.</param>
+        /// <param name="params">Connection parameters.</param>
+        /// <returns>Returns an IMAP stream on success or FALSE on error.</returns>
+        [return: CastToFalse]
+        public static PhpResource imap_open(string mailbox, string username , string password, int options, int n_retries, PhpArray @params)
+        {
+            // Unsupported flags: authuser, debug, (nntp - can be done), readonly
+            // Unsupported options: OP_SECURE, OP_PROTOTYPE, OP_SILENT, OP_SHORTCACHE, OP_DEBUG, OP_READONLY, OP_ANONYMOUS, OP_HALFOPEN, CL_EXPUNGE
+            // Unsupported n_retries, params
+
+            if (!TryParseHostName(mailbox, out MailBoxInfo info))
+                return null;
+
+            if (!String.IsNullOrEmpty(info.User))
+                username = info.User;
+
+            if (info.NameFlags.Contains("anonymous"))
+                username = "ANONYMOUS";
+
+            try
+            {
+                MailResource resource = MailResource.Create(info);
+                
+                if (resource == null)
+                    return null;
+                if (!resource.Login(username, password))
+                    return null;
+
+                if (resource is ImapResource imap) // There is only one folder in POP3.
+                {
+                    if (String.IsNullOrEmpty(info.MailBoxName))
+                        imap.Select("INBOX");
+                    else
+                        imap.Select(info.MailBoxName);
+                }
+      
+                return resource;
+            }
+            catch (SocketException)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Closes the imap stream.
+        /// </summary>
+        /// <param name="imap_stream">An IMAP stream returned by imap_open().</param>
+        /// <param name="flag">If set to CL_EXPUNGE, the function will silently expunge the mailbox before closing, removing all messages marked for deletion. You can achieve the same thing by using imap_expunge()</param>
+        /// <returns>Returns TRUE on success or FALSE on failure.</returns>
+        public static bool imap_close(PhpResource imap_stream, int flag = 0)
+        {
+            MailResource resource = ValidateMailResource(imap_stream);
+            if (resource == null)
+                return false;
+
+            if ((flag & CL_EXPUNGE) == CL_EXPUNGE)
+            {
+                //TODO: Call imap_expunge
+                throw new NotImplementedException();
+            }
+
+            resource.Close();
+            return true;
+        }
+        #endregion
     }
 }
